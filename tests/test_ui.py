@@ -8,6 +8,7 @@ Runs two ways:
 Forces the dummy SDL drivers so it works headless over SSH.
 """
 
+import io
 import os
 import sys
 import types
@@ -15,9 +16,11 @@ import types
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-# Make the app/ package importable (ui/, btvolume.py live there).
+# Make the app/ package importable (ui/, btvolume.py, npdraw.py live there) and
+# app/views (the engine demo view) importable by its bare module name.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "app"))
+sys.path.insert(0, os.path.join(_HERE, "..", "app", "views"))
 
 import pygame
 pygame.init()
@@ -26,6 +29,10 @@ from ui import (WindowManager, Container, VBox, HBox, Spacer,
                 Label, Button, ProgressBar, VolumeFader, SolidRect, merge_rects,
                 set_screen_size)
 import btvolume
+
+# The production render pipeline + the engine demo view that composes through it.
+import npdraw
+from nowplaying_view import NowPlayingScene, NowPlayingView, build
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +286,131 @@ def test_btvolume_softvol_fallback():
     assert bt.set(0.5) is True
     # it discovered the PCM and issued a volume set of 64
     assert any(c[:2] == ["bluealsactl", "volume"] and c[-1] == "64" for c in cmds)
+
+
+# ---------------------------------------------------------------------------
+# npdraw: the shared production render pipeline (single source of truth for
+# every now-playing pixel). These guard that the demo cannot drift from prod.
+# ---------------------------------------------------------------------------
+_NP_CACHE = {}
+
+
+def _np_visuals():
+    """Memoised preview visual bundle (cover/shadow/bg/accent) -- build_visuals
+    does PIL work, so build it once for the whole suite."""
+    if "vis" not in _NP_CACHE:
+        _NP_CACHE["vis"] = npdraw.build_visuals(npdraw.preview_cover_bytes())
+    return _NP_CACHE["vis"]
+
+
+def _np_fonts():
+    if "fonts" not in _NP_CACHE:
+        _NP_CACHE["fonts"] = npdraw.make_fonts()
+    return _NP_CACHE["fonts"]
+
+
+def _np_scene_dict():
+    """A fresh scene bundle for compose_now_playing (fresh info copy, shared
+    immutable visual surfaces)."""
+    vis = _np_visuals()
+    return {'cover': vis['cover'], 'shadow': vis['shadow'], 'bg': vis['bg'],
+            'accent': vis['accent'], 'info': dict(npdraw.preview_info()),
+            'mode': 'airplay', 'connected': True}
+
+
+def test_npdraw_preview_info_is_frozen_snapshot():
+    info = npdraw.preview_info()
+    # prog_at falsy => draw_progress skips its time.monotonic live-advance term
+    # => the composited frame is fully deterministic (byte-diffable).
+    assert info["prog_at"] == 0
+    assert info["playing"] is True
+    assert info["title"] and info["artist"] and info["album"]
+    for k in ("volume", "prog_start", "prog_cur", "prog_end", "hw_rate", "hw_bits"):
+        assert k in info
+
+
+def test_npdraw_preview_cover_is_png():
+    cb = npdraw.preview_cover_bytes()
+    assert cb[:8] == b"\x89PNG\r\n\x1a\n"            # PNG signature
+    surf = pygame.image.load(io.BytesIO(cb))         # pygame can decode it
+    assert surf.get_width() > 0 and surf.get_height() > 0
+
+
+def test_npdraw_build_visuals_bundle():
+    vis = _np_visuals()
+    assert {"cover", "shadow", "bg", "accent"} <= set(vis)
+    assert isinstance(vis["accent"], tuple) and len(vis["accent"]) == 3
+    assert all(0 <= c <= 255 for c in vis["accent"])
+    assert vis["bg"].get_size() == (npdraw.W, npdraw.H)   # full-screen blur
+    assert max(vis["cover"].get_size()) <= npdraw.COVER_MAX
+
+
+def test_npdraw_make_fonts_has_now_playing_keys():
+    fonts = _np_fonts()
+    for k in ("title", "artist", "album", "time", "badge", "vol"):
+        assert k in fonts
+        assert fonts[k].render("x", True, (255, 255, 255)).get_height() > 0
+
+
+def test_npdraw_compose_is_deterministic():
+    fonts = _np_fonts()
+
+    def frame():
+        s = pygame.Surface((npdraw.W, npdraw.H))      # opaque, like the framebuffer
+        npdraw.compose_now_playing(s, _np_scene_dict(), fonts)
+        return pygame.image.tobytes(s, "RGBA")
+
+    assert frame() == frame()                          # no time/animation leak
+
+
+def test_npdraw_compose_paints_full_frame():
+    fonts = _np_fonts()
+    s = pygame.Surface((npdraw.W, npdraw.H))
+    npdraw.compose_now_playing(s, _np_scene_dict(), fonts)
+    assert s.get_at((0, 0))[:3] != (0, 0, 0)          # background blit covers (0,0)
+
+
+# ---------------------------------------------------------------------------
+# Engine demo view: the now-playing scene composed through npdraw, on the
+# retained-mode engine. Must stay pixel-identical to a direct prod compose.
+# ---------------------------------------------------------------------------
+def test_scene_cache_is_opaque():
+    # The scene paints every pixel, so its cache must NOT be SRCALPHA: an
+    # intermediate alpha layer rounds the alpha-blended button glows (pygame's
+    # straight-alpha blit is not associative) and drifts from prod's framebuffer.
+    scene = NowPlayingScene(_np_fonts())
+    scene.render_cache()
+    assert not (scene._cache.get_flags() & pygame.SRCALPHA)
+
+
+def test_engine_view_matches_direct_compose():
+    # The whole point of the rebuild: the engine view path yields the EXACT
+    # same pixels as composing straight onto the framebuffer with npdraw.
+    fonts = _np_fonts()
+    vis = _np_visuals()
+
+    direct = pygame.Surface((npdraw.W, npdraw.H))      # what prod's loop draws onto
+    npdraw.compose_now_playing(direct, _np_scene_dict(), fonts)
+
+    screen = _display(npdraw.W, npdraw.H)
+    wm, view = build(screen, fonts=fonts)
+    snap = dict(npdraw.preview_info())
+    snap.update(visuals=vis, mode="airplay", connected=True)
+    view.update(snap)
+    wm.layout()
+    wm.render()
+
+    assert pygame.image.tobytes(screen, "RGBA") == \
+           pygame.image.tobytes(direct, "RGBA")
+
+
+def test_view_overlays_paint_nothing():
+    # The invisible touch overlays contribute zero pixels (the scene owns every
+    # pixel); their caches are fully transparent.
+    view = NowPlayingView(fonts=_np_fonts())
+    for ov in (*view.btns, view.toggle, view.fader):
+        ov.render_cache()
+        assert ov._cache.get_bounding_rect().width == 0   # nothing opaque
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,15 @@
 """
-render_demo.py - Build the NowPlayingView, push fake data, composite one frame
-and save it to docs/preview.png. Proves the engine assembles a real screen.
+render_demo.py - Composite ONE now-playing frame through the engine + the
+production draw pipeline and save it to docs/preview.png.
+
+Because the demo view renders via ``npdraw`` (the exact code the live app runs),
+this image is pixel-identical to the real screen -- the only requirement is that
+the Inter fonts are installed (they are on the Pi). On a dev box without Inter it
+falls back to DejaVu, so run this ON THE PI for the authoritative preview.
+
+It feeds the SAME synthetic cover + metadata prod injects on SIGUSR2
+("Midnight City / M83"), so the preview matches a real captured frame.
+
 Headless: SDL_VIDEODRIVER=dummy.
 """
 
@@ -16,39 +25,33 @@ sys.path.insert(0, os.path.join(_HERE, "..", "app", "views"))
 
 import pygame
 pygame.init()
+
+import npdraw
 from nowplaying_view import build
 
 
-def synth_cover(size=320):
-    s = pygame.Surface((size, size))
-    for y in range(size):
-        t = y / size
-        col = (int(40 + 120 * t), int(20 + 60 * (1 - t)), int(90 + 120 * t))
-        pygame.draw.line(s, col, (0, y), (size, y))
-    pygame.draw.circle(s, (255, 255, 255), (size // 2, size // 2), size // 5, 6)
-    return s
-
-
 def main():
-    screen = pygame.display.set_mode((800, 480))
-    # warm time-of-day gradient background
-    bg = pygame.Surface((800, 480))
-    for y in range(480):
-        t = y / 480
-        bg.fill((int(12 + 8 * t), int(10 + 6 * t), int(18 + 14 * t)),
-                pygame.Rect(0, y, 800, 1))
+    screen = pygame.display.set_mode((npdraw.W, npdraw.H))
 
     wm, view = build(screen,
                      on_transport=lambda a: print("transport:", a),
+                     on_mode_toggle=lambda: print("mode toggle"),
                      on_volume=lambda v: print(f"volume: {v:.2f}"))
-    wm.set_background(bg)
-    view.update({"title": "Re:Stacks", "artist": "Bon Iver",
-                 "playing": True, "pos": 73, "dur": 215,
-                 "volume": 0.62, "cover": synth_cover()})
+
+    # Exact production preview: synthetic cover -> real visual pipeline, plus the
+    # injected now-playing metadata (1:13 / 4:04, AirPlay 44.1 kHz / 16-bit).
+    visuals = npdraw.build_visuals(npdraw.preview_cover_bytes())
+    snap = dict(npdraw.preview_info())
+    snap["visuals"] = visuals
+    snap["mode"] = "airplay"
+    snap["connected"] = True
+    view.update(snap)
+
     wm.layout()
     rects = wm.render()
 
     out = os.path.join(_HERE, "..", "docs", "preview.png")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     pygame.image.save(screen, out)
     print(f"saved {os.path.normpath(out)}  (updated {len(rects)} rect(s))")
 
