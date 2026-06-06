@@ -233,3 +233,13 @@ def set_bt_volume(pct, log=None):
     if _DEFAULT is None:
         _DEFAULT = BtVolume(log=log)
     return _DEFAULT.set_percent(pct)
+
+
+def get_bt_volume_percent(log=None):
+    """Current Bluetooth volume in percent [0, 100], or None if no A2DP
+    transport is currently exposing an AVRCP volume. Mirrors set_bt_volume so
+    the app can read the real level instead of the muted on-board mixer."""
+    global _DEFAULT
+    if _DEFAULT is None:
+        _DEFAULT = BtVolume(log=log)
+    return _DEFAULT.get_percent()

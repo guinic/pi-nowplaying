@@ -49,6 +49,17 @@ import pygame
 from npconfig import *
 from npstate import State, state
 
+# CHANTIER 1.4 - Bluetooth volume done right. AVRCP absolute volume via BlueZ
+# MediaTransport1.Volume (audible + syncs the phone's HUD), with a bluez-alsa
+# soft-volume fallback. Guarded import: a missing/broken module must never take
+# the display down -- the BT-volume functions below fall back to the legacy
+# (inaudible) mixer path when _btvol is None.
+try:
+    import btvolume as _btvol
+except Exception as _e:                       # pragma: no cover - defensive
+    _btvol = None
+    log.warning(f"btvolume unavailable, BT volume falls back to amixer: {_e}")
+
 # ---------------------------------------------------------------------------
 # Clean exit on SIGTERM
 # ---------------------------------------------------------------------------
@@ -127,14 +138,27 @@ def set_airplay_volume(frac):
         log.warning(f"set_airplay_volume {frac:.2f}: {e}")
 
 def set_bt_volume(pct):
-    """Absolute Bluetooth volume: drive the hardware PCM mixer to an exact %."""
+    """Absolute Bluetooth volume.
+
+    Primary path: AVRCP absolute volume via BlueZ MediaTransport1.Volume (see
+    btvolume.py) -- audible, and the phone's own volume HUD follows. The old
+    `amixer -c Headphones sset PCM` drove the bypassed on-board jack (a muted
+    card on this unit), so BT volume used to be inaudible; it survives only as a
+    last-resort fallback. The UI fader is always updated so it never freezes."""
     pct = max(0, min(100, int(round(pct))))
-    try:
-        subprocess.run(['amixer', '-c', 'Headphones', 'sset', 'PCM', f'{pct}%'],
-                       capture_output=True, timeout=3)
-        state.set(volume=pct)
-    except Exception as e:
-        log.warning(f"set_bt_volume: {e}")
+    ok = False
+    if _btvol is not None:
+        try:
+            ok = _btvol.set_bt_volume(pct, log=log)   # AVRCP absolute, bluez-alsa fallback
+        except Exception as e:
+            log.warning(f"set_bt_volume (btvolume): {e}")
+    if not ok:
+        try:
+            subprocess.run(['amixer', '-c', 'Headphones', 'sset', 'PCM', f'{pct}%'],
+                           capture_output=True, timeout=3)
+        except Exception as e:
+            log.warning(f"set_bt_volume (amixer fallback): {e}")
+    state.set(volume=pct)
 
 def set_volume_abs(pct, mode):
     if mode == 'bluetooth':
@@ -352,6 +376,15 @@ def send_avrcp(action):
         log.warning(f"AVRCP {action} failed: {e}")
 
 def _read_pcm_pct():
+    """Current BT volume %. Prefer the real AVRCP level (btvolume); fall back to
+    the on-board mixer reading. Returns -1 if neither is available."""
+    if _btvol is not None:
+        try:
+            p = _btvol.get_bt_volume_percent(log=log)
+            if p is not None:
+                return p
+        except Exception:
+            pass
     try:
         r = subprocess.run(['amixer', '-c', 'Headphones', 'sget', 'PCM'],
                            capture_output=True, text=True, timeout=3)
@@ -361,18 +394,17 @@ def _read_pcm_pct():
         return -1
 
 def bt_volume(direction, steps=1):
-    """Bluetooth mode volume: drive the hardware PCM mixer (the BT path doesn't
-    otherwise touch it). Updates state.volume so the overlay reflects the change."""
-    sign = '+' if direction > 0 else '-'
-    pct_step = 4 * max(1, min(8, steps))
-    try:
-        subprocess.run(['amixer', '-c', 'Headphones', '--', 'sset', 'PCM',
-                        f'{pct_step}%{sign}'], capture_output=True, timeout=3)
-    except Exception as e:
-        log.warning(f"bt_volume: {e}")
-    pct = _read_pcm_pct()
-    if pct >= 0:
-        state.set(volume=pct)
+    """Bluetooth relative volume (swipe up/down). Read the current AVRCP level,
+    step it, then apply it as an absolute AVRCP set -- the same audible path as
+    the fader. set_bt_volume() updates state.volume (and falls back to the
+    legacy mixer if AVRCP is unavailable), so the overlay always reflects it."""
+    step = 4 * max(1, min(8, steps)) * (1 if direction > 0 else -1)
+    cur = _read_pcm_pct()
+    if cur < 0:
+        cur = state.snapshot().get('volume', -1)
+    if cur < 0:
+        cur = 50  # nothing to read from yet; start from a sane midpoint
+    set_bt_volume(max(0, min(100, cur + step)))
 
 # ===========================================================================
 # Receiver mode via sudo helper script
