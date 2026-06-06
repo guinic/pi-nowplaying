@@ -1,0 +1,133 @@
+name: Deploy now-playing to the Pi
+
+# CHANTIER 4 - CI/CD. On every push to main that touches the app, ship the
+# Python tree to the Raspberry Pi over SSH and restart the service, keeping the
+# project's golden rule: NEVER crash the display (compile-check + headless
+# import smoke + tagged backup happen BEFORE the live file is swapped).
+#
+# REACHING A PI ON A HOME LAN
+# ---------------------------
+# GitHub's cloud runners cannot route to 192.168.x.x. Two supported options:
+#   (A) Tailscale (default here): the runner joins your tailnet and SSHes to the
+#       Pi's MagicDNS name / 100.x address. No port-forwarding, encrypted.
+#   (B) Self-hosted runner on the LAN: delete the Tailscale step and set
+#       `runs-on: [self-hosted, rpi]`. Then PI_HOST can be the 192.168 address.
+#
+# REQUIRED SECRETS (Settings -> Secrets and variables -> Actions)
+#   SSH_PRIVATE_KEY   private half of an ed25519 deploy key
+#                     (ssh-keygen -t ed25519 -f deploy_key -N ""; append
+#                      deploy_key.pub to ~hifi/.ssh/authorized_keys on the Pi)
+#   SSH_KNOWN_HOSTS   pinned host key, from:  ssh-keyscan -t ed25519 <pi-host>
+#   PI_HOST           Tailscale MagicDNS name (e.g. hifi-pi) or 100.x IP
+#   PI_USER           login user (hifi)
+#   TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET   Tailscale OAuth client (option A)
+# OPTIONAL
+#   vars.OVERLAY_MANAGED = "true"  if the Pi runs the read-only overlay
+#                          (CHANTIER 3): the job flips it off, deploys, on.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:        # manual "Run workflow" button
+
+# Never let two deploys race onto the device.
+concurrency:
+  group: pi-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DEST: /opt/nowplaying
+      SSH: ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- option A: join the tailnet so we can reach the Pi -------------
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Configure SSH (key + pinned known_hosts)
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Disable read-only overlay (if managed)
+        if: vars.OVERLAY_MANAGED == 'true'
+        run: |
+          $SSH "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" \
+            'sudo fsprotect off && sudo systemctl reboot' || true
+          echo "Waiting for the Pi to come back writable..."
+          for i in $(seq 1 30); do
+            sleep 10
+            $SSH -o ConnectTimeout=5 "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" \
+              'fsprotect status' && break
+          done
+
+      - name: Stage files to the Pi (rsync)
+        run: |
+          rsync -az --delete \
+            --exclude '__pycache__' --exclude '*.pyc' \
+            -e "$SSH" \
+            app/ "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}:/tmp/np_stage/"
+
+      - name: Compile-check + headless import smoke (abort before touching live)
+        run: |
+          $SSH "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" bash -se <<'REMOTE'
+          set -euo pipefail
+          cd /tmp/np_stage
+          python3 -m py_compile $(find . -name '*.py')
+          echo "compile: OK"
+          SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy timeout 25 \
+            python3 -c "import sys; sys.path.insert(0,'.'); import npconfig, npstate, btvolume; print('import: OK')"
+          REMOTE
+
+      - name: Backup + install + restart
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          $SSH "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" "TAG=$TAG DEST=$DEST bash -se" <<'REMOTE'
+          set -euo pipefail
+          for f in nowplaying.py npconfig.py npstate.py btvolume.py; do
+            [ -f "$DEST/$f" ] && sudo cp "$DEST/$f" "$DEST/$f.bak.$TAG" || true
+          done
+          sudo mkdir -p "$DEST"
+          sudo rsync -a /tmp/np_stage/ "$DEST/"
+          sudo chown -R root:root "$DEST"
+          sudo find "$DEST" -name '*.py' -exec chmod 775 {} +
+          sudo systemctl restart nowplaying
+          REMOTE
+
+      - name: Verify healthy (fail the job if the display did not come up)
+        run: |
+          sleep 5
+          $SSH "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" bash -se <<'REMOTE'
+          set -euo pipefail
+          active=$(systemctl is-active nowplaying || true)
+          echo "nowplaying: $active"
+          journalctl -u nowplaying --since '-30 seconds' --no-pager | tail -n 15
+          if [ "$active" != "active" ]; then
+            echo "::error::nowplaying is not active after deploy"; exit 1
+          fi
+          if journalctl -u nowplaying --since '-30 seconds' --no-pager \
+               | grep -iE 'traceback|modulenotfound|importerror'; then
+            echo "::error::startup errors detected"; exit 1
+          fi
+          REMOTE
+
+      - name: Re-enable read-only overlay (if managed)
+        if: always() && vars.OVERLAY_MANAGED == 'true'
+        run: |
+          $SSH "${{ secrets.PI_USER }}@${{ secrets.PI_HOST }}" \
+            'sudo fsprotect on && sudo systemctl reboot' || true

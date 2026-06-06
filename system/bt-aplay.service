@@ -1,0 +1,12 @@
+[Unit]
+Description=BlueALSA player -> hifi output (hifi)
+After=bt-bluealsa.service
+Requires=bt-bluealsa.service
+
+[Service]
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 25); do busctl list 2>/dev/null | grep -q org.bluealsa && exit 0; sleep 0.2; done; exit 0'
+ExecStart=/usr/bin/bluealsa-aplay --profile-a2dp --pcm=_audioout 00:00:00:00:00:00
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=3
+KillMode=mixed

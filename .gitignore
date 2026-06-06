@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# virtualenvs
+.venv/
+venv/
+env/
+
+# deploy backups left on the Pi (never commit)
+*.bak.*
+
+# build artifacts
+build/
+dist/
+
+# OS cruft
+.DS_Store
+Thumbs.db

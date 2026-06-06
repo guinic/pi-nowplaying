@@ -1,0 +1,29 @@
+[Unit]
+Description=Now Playing Display (framebuffer)
+After=network.target shairport-sync.service
+Wants=shairport-sync.service
+Conflicts=localdisplay.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hifi
+Group=hifi
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 /opt/nowplaying/nowplaying.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_VIDEO_KMSDRM_DEVICE=/dev/dri/card0
+Environment=SDL_VIDEO_DOUBLE_BUFFER=0
+Environment=SDL_AUDIODRIVER=dummy
+Environment=DISPLAY=
+Environment=PYTHONUNBUFFERED=1
+SupplementaryGroups=video render audio
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nowplaying
+
+[Install]
+WantedBy=multi-user.target
