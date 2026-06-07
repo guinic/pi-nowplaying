@@ -370,6 +370,32 @@ def test_npdraw_compose_paints_full_frame():
     assert s.get_at((0, 0))[:3] != (0, 0, 0)          # background blit covers (0,0)
 
 
+def test_npdraw_sanitize_strips_control_chars():
+    # TuneBlade (and other AirPlay senders) NUL-terminate metadata strings; a raw
+    # \x00 makes SDL_ttf's font.render raise "A null character was found in the
+    # text", which used to storm the prod display into a KMSDRM reinit loop.
+    assert npdraw.sanitize_text("a\x00b\x01c\x7f") == "abc"   # NUL + ctrl + DEL gone
+    assert npdraw.sanitize_text("Midnight City") == "Midnight City"  # clean = no-op
+    assert npdraw.sanitize_text("") == ""                     # empty/None safe
+    assert npdraw.sanitize_text(None) is None
+
+
+def test_npdraw_render_helpers_survive_nul():
+    # The guard lives at the render chokepoint too (defense in depth): a NUL must
+    # never reach font.render, even if an un-sanitised string slips through.
+    font = _np_fonts()["title"]
+    assert npdraw.text_surf(font, "Bad\x00Title", (255, 255, 255), 9999) is not None
+    assert npdraw.text_surf(font, "\x00", (255, 255, 255), 9999) is None   # -> empty
+    assert npdraw.full_text_surf(font, "X\x00Y", (255, 255, 255)) is not None
+    # prove SDL_ttf itself still rejects a raw NUL -> our strip is what saves it
+    # (plain try/except: the Pi runs this file with no pytest installed)
+    try:
+        font.render("boom\x00", True, (255, 255, 255))
+        raise AssertionError("expected font.render to reject a raw NUL")
+    except ValueError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Engine demo view: the now-playing scene composed through npdraw, on the
 # retained-mode engine. Must stay pixel-identical to a direct prod compose.

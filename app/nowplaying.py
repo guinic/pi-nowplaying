@@ -432,8 +432,27 @@ def apply_mode(mode):
 # ===========================================================================
 # Metadata reader thread
 # ===========================================================================
+# C0 control chars (NUL, ...) have no place in metadata text and crash SDL_ttf
+# with "A null character was found in the text". Non-Apple AirPlay senders such
+# as TuneBlade NUL-terminate their strings, so a single \x00 in a title used to
+# put the render loop into a display-reinit storm (the screen dropped to the
+# kernel console). Strip every C0 control char + DEL -- both here at the source
+# and again at the render chokepoint (text_surf / full_text_surf): defence in
+# depth so a malformed field can never crash the display (the golden rule).
+_CTRL_TABLE = {i: None for i in range(0x20)}
+_CTRL_TABLE[0x7F] = None
+
+def sanitize_text(s):
+    """Drop control chars that would crash SDL_ttf or render as tofu."""
+    return s.translate(_CTRL_TABLE) if s else s
+
 def decode_text(d):
-    return d.decode('utf-8', errors='replace').strip()
+    raw = d.decode('utf-8', errors='replace')
+    clean = sanitize_text(raw)
+    if clean != raw:
+        # one line per offending field -> shows exactly what the sender emitted
+        log.info(f"metadata: stripped control char(s) {raw!r} -> {clean!r}")
+    return clean.strip()
 
 def handle_item(t, c, d):
     if t == CORE:
@@ -926,6 +945,7 @@ def load_font(size, bold=False, weight=None, display=False):
 
 _text_cache = {}
 def text_surf(font, text, color, max_w):
+    text = sanitize_text(text)          # never feed a NUL/control char to SDL_ttf
     key = (id(font), text, color, max_w)
     s = _text_cache.get(key)
     if s is None:
@@ -948,6 +968,7 @@ def full_text_surf(font, text, color, shadow=True):
     The marquee needs the real pixel width to know when to scroll, and the baked
     shadow keeps the text legible over any album-art background (no per-frame
     cost -- it is rendered once and reused)."""
+    text = sanitize_text(text)          # never feed a NUL/control char to SDL_ttf
     if not text:
         return None
     key = (id(font), text, color, shadow)

@@ -179,10 +179,24 @@ def soft_glow(surf, scale=7):
     return pygame.transform.smoothscale(small, (w, h))
 
 
+# Strip control chars (NUL/\x01.. + DEL) before they reach SDL_ttf. Some AirPlay
+# senders (e.g. TuneBlade) NUL-terminate metadata strings; a raw \x00 makes
+# font.render raise "A null character was found in the text". This is the exact
+# same guard prod's nowplaying.py applies, so the demo stays a faithful port.
+_CTRL_TABLE = {i: None for i in range(0x20)}
+_CTRL_TABLE[0x7F] = None
+
+
+def sanitize_text(s):
+    """Drop control chars that would crash SDL_ttf or render as tofu."""
+    return s.translate(_CTRL_TABLE) if s else s
+
+
 _text_cache = {}
 
 
 def text_surf(font, text, color, max_w):
+    text = sanitize_text(text)          # never feed a NUL/control char to SDL_ttf
     key = (id(font), text, color, max_w)
     s = _text_cache.get(key)
     if s is None:
@@ -208,6 +222,7 @@ def full_text_surf(font, text, color, shadow=True):
     The marquee needs the real pixel width to know when to scroll, and the baked
     shadow keeps the text legible over any album-art background (no per-frame
     cost -- it is rendered once and reused)."""
+    text = sanitize_text(text)          # never feed a NUL/control char to SDL_ttf
     if not text:
         return None
     key = (id(font), text, color, shadow)
